@@ -25,6 +25,14 @@
 //      Rewarded Host change the timing. If no Rewarded Host has signed up
 //      yet, the Rewarder can change it instead. If both are present, only
 //      the Rewarded Host can.
+//   6. Right-clicking the card -> Apps -> "Assign Role" lets an Ambassador
+//      manually place someone into a slot (pick a role, then pick a person)
+//      as if that person had reacted themselves. Rewarded Host assignments
+//      still require the target to actually be an Ambassador.
+//   7. Right-clicking the card -> Apps -> "Unassign Role" lets an Ambassador
+//      remove someone from a slot (pick a role, then pick from the people
+//      currently signed up for it) — for cases where someone can't remove
+//      their own reaction themselves.
 //
 //  Event state lives in data/events.json, keyed by message ID, so sign-ups
 //  survive bot restarts.
@@ -52,6 +60,8 @@ const {
   TextInputBuilder,
   TextInputStyle,
   ActionRowBuilder,
+  StringSelectMenuBuilder,
+  UserSelectMenuBuilder,
   EmbedBuilder,
   MessageFlags,
 } = require('discord.js');
@@ -191,12 +201,18 @@ client.once(Events.ClientReady, async (c) => {
     new ContextMenuCommandBuilder()
       .setName('Update Timing')
       .setType(ApplicationCommandType.Message),
+    new ContextMenuCommandBuilder()
+      .setName('Assign Role')
+      .setType(ApplicationCommandType.Message),
+    new ContextMenuCommandBuilder()
+      .setName('Unassign Role')
+      .setType(ApplicationCommandType.Message),
   ];
 
   try {
     const guild = await c.guilds.fetch(CONFIG.guildId);
     await guild.commands.set(commands.map((cmd) => cmd.toJSON()));
-    console.log('Registered /event and "Update Timing" for guild', CONFIG.guildId);
+    console.log('Registered /event, "Update Timing", "Assign Role", and "Unassign Role" for guild', CONFIG.guildId);
   } catch (err) {
     console.error('Failed to register commands:', err);
   }
@@ -213,8 +229,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isMessageContextMenuCommand() && interaction.commandName === 'Update Timing') {
       return handleUpdateTimingMenu(interaction);
     }
+    if (interaction.isMessageContextMenuCommand() && interaction.commandName === 'Assign Role') {
+      return handleAssignRoleMenu(interaction);
+    }
+    if (interaction.isMessageContextMenuCommand() && interaction.commandName === 'Unassign Role') {
+      return handleUnassignRoleMenu(interaction);
+    }
     if (interaction.isModalSubmit() && interaction.customId.startsWith('leon:timingModal:')) {
       return handleTimingModalSubmit(interaction);
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leon:assignRole:')) {
+      return handleAssignRoleSelect(interaction);
+    }
+    if (interaction.isUserSelectMenu() && interaction.customId.startsWith('leon:assignUser:')) {
+      return handleAssignUserSelect(interaction);
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leon:unassignRole:')) {
+      return handleUnassignRoleSelect(interaction);
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('leon:unassignUser:')) {
+      return handleUnassignUserSelect(interaction);
     }
   } catch (err) {
     console.error('Interaction handler error:', err);
@@ -318,6 +352,224 @@ async function handleTimingModalSubmit(interaction) {
   }
 
   await interaction.reply({ content: 'Timing updated. ✅', flags: MessageFlags.Ephemeral });
+}
+
+// ----------------------------------------------------------------------------
+//  Right-click a card -> "Assign Role" (Ambassadors manually place someone
+//  into a slot, as if that person had reacted themselves)
+// ----------------------------------------------------------------------------
+async function handleAssignRoleMenu(interaction) {
+  const message = interaction.targetMessage;
+  const record = getEvent(message.id);
+
+  if (!record) {
+    return interaction.reply({
+      content: 'That message isn’t a Leon event card.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  if (!interaction.member.roles.cache.has(CONFIG.ambassadorRoleId)) {
+    return interaction.reply({
+      content: 'Only Ambassadors can manually assign roles.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const roleSelect = new StringSelectMenuBuilder()
+    .setCustomId(`leon:assignRole:${message.id}`)
+    .setPlaceholder('Choose a role')
+    .addOptions(
+      Object.keys(EMOJI).map((role) => ({
+        label: ROLE_LABELS[role],
+        value: role,
+        emoji: EMOJI[role],
+      }))
+    );
+
+  await interaction.reply({
+    content: `Assigning a role for **${record.title}** — pick which one:`,
+    components: [new ActionRowBuilder().addComponents(roleSelect)],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleAssignRoleSelect(interaction) {
+  const messageId = interaction.customId.split(':')[2];
+  const record = getEvent(messageId);
+
+  if (!record) {
+    return interaction.update({
+      content: 'Couldn’t find that event anymore — it may have been deleted.',
+      components: [],
+    });
+  }
+
+  const role = interaction.values[0];
+
+  const userSelect = new UserSelectMenuBuilder()
+    .setCustomId(`leon:assignUser:${messageId}:${role}`)
+    .setPlaceholder('Choose the person to assign')
+    .setMinValues(1)
+    .setMaxValues(1);
+
+  await interaction.update({
+    content: `Pick the person to assign as **${ROLE_LABELS[role]}**:`,
+    components: [new ActionRowBuilder().addComponents(userSelect)],
+  });
+}
+
+async function handleAssignUserSelect(interaction) {
+  const [, , messageId, role] = interaction.customId.split(':');
+  const record = getEvent(messageId);
+
+  if (!record) {
+    return interaction.update({
+      content: 'Couldn’t find that event anymore — it may have been deleted.',
+      components: [],
+    });
+  }
+
+  const targetUserId = interaction.values[0];
+
+  // Same rule as reacting yourself: Rewarded Host must actually be an Ambassador.
+  if (role === 'rewardedHost') {
+    const guild = await client.guilds.fetch(CONFIG.guildId);
+    const targetMember = await guild.members.fetch(targetUserId).catch(() => null);
+    const isAmbassador = targetMember?.roles.cache.has(CONFIG.ambassadorRoleId);
+
+    if (!isAmbassador) {
+      return interaction.update({
+        content: `<@${targetUserId}> isn’t an Ambassador, so they can’t be assigned as Rewarded Host.`,
+        components: [],
+      });
+    }
+  }
+
+  if (!record.roles[role].includes(targetUserId)) {
+    record.roles[role].push(targetUserId);
+    saveEvent(messageId, record);
+
+    const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);
+    if (msg) {
+      await msg.edit({ embeds: [renderEmbed(record)] }).catch(() => {});
+    }
+  }
+
+  await interaction.update({
+    content: `Assigned <@${targetUserId}> as **${ROLE_LABELS[role]}**. ✅`,
+    components: [],
+  });
+}
+
+// ----------------------------------------------------------------------------
+//  Right-click a card -> "Unassign Role" (Ambassadors remove someone from a
+//  slot they can't or didn't remove themselves via reaction)
+// ----------------------------------------------------------------------------
+async function handleUnassignRoleMenu(interaction) {
+  const message = interaction.targetMessage;
+  const record = getEvent(message.id);
+
+  if (!record) {
+    return interaction.reply({
+      content: 'That message isn’t a Leon event card.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  if (!interaction.member.roles.cache.has(CONFIG.ambassadorRoleId)) {
+    return interaction.reply({
+      content: 'Only Ambassadors can manually remove role sign-ups.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const roleSelect = new StringSelectMenuBuilder()
+    .setCustomId(`leon:unassignRole:${message.id}`)
+    .setPlaceholder('Choose a role')
+    .addOptions(
+      Object.keys(EMOJI).map((role) => ({
+        label: ROLE_LABELS[role],
+        value: role,
+        emoji: EMOJI[role],
+      }))
+    );
+
+  await interaction.reply({
+    content: `Removing someone from a role for **${record.title}** — pick which one:`,
+    components: [new ActionRowBuilder().addComponents(roleSelect)],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleUnassignRoleSelect(interaction) {
+  const messageId = interaction.customId.split(':')[2];
+  const record = getEvent(messageId);
+
+  if (!record) {
+    return interaction.update({
+      content: 'Couldn’t find that event anymore — it may have been deleted.',
+      components: [],
+    });
+  }
+
+  const role = interaction.values[0];
+  const ids = record.roles[role];
+
+  if (!ids.length) {
+    return interaction.update({
+      content: `No one is currently signed up as **${ROLE_LABELS[role]}**.`,
+      components: [],
+    });
+  }
+
+  const guild = await client.guilds.fetch(CONFIG.guildId);
+  const options = [];
+  for (const id of ids) {
+    const member = await guild.members.fetch(id).catch(() => null);
+    const label = member ? member.displayName || member.user.username : `Unknown user (${id})`;
+    options.push({ label: label.slice(0, 100), value: id });
+  }
+
+  const userSelect = new StringSelectMenuBuilder()
+    .setCustomId(`leon:unassignUser:${messageId}:${role}`)
+    .setPlaceholder('Choose who to remove')
+    .addOptions(options);
+
+  await interaction.update({
+    content: `Pick who to remove from **${ROLE_LABELS[role]}**:`,
+    components: [new ActionRowBuilder().addComponents(userSelect)],
+  });
+}
+
+async function handleUnassignUserSelect(interaction) {
+  const [, , messageId, role] = interaction.customId.split(':');
+  const record = getEvent(messageId);
+
+  if (!record) {
+    return interaction.update({
+      content: 'Couldn’t find that event anymore — it may have been deleted.',
+      components: [],
+    });
+  }
+
+  const targetUserId = interaction.values[0];
+  const idx = record.roles[role].indexOf(targetUserId);
+
+  if (idx !== -1) {
+    record.roles[role].splice(idx, 1);
+    saveEvent(messageId, record);
+
+    const msg = await interaction.channel.messages.fetch(messageId).catch(() => null);
+    if (msg) {
+      await msg.edit({ embeds: [renderEmbed(record)] }).catch(() => {});
+    }
+  }
+
+  await interaction.update({
+    content: `Removed <@${targetUserId}> from **${ROLE_LABELS[role]}**. ✅`,
+    components: [],
+  });
 }
 
 // Rewarded Host can always edit timing if any are signed up.
