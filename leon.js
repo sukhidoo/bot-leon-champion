@@ -137,10 +137,12 @@ function blankRoles() {
 //  Embed rendering
 // ----------------------------------------------------------------------------
 function renderEmbed(record) {
-  const lines = Object.keys(EMOJI).map((role) => {
+  const roleFields = Object.keys(EMOJI).map((role) => {
     const ids = record.roles[role];
-    const value = ids.length ? ids.map((id) => `<@${id}>`).join(', ') : '_____';
-    return `${EMOJI[role]} **${ROLE_LABELS[role]}:** ${value}`;
+    // "Open" instead of underscores — a run of underscores gets parsed by
+    // Discord as underline/italic markdown and mangles the whole card.
+    const value = ids.length ? ids.map((id) => `<@${id}>`).join(', ') : 'Open';
+    return { name: `${EMOJI[role]} ${ROLE_LABELS[role]}`, value, inline: false };
   });
 
   return new EmbedBuilder()
@@ -148,9 +150,9 @@ function renderEmbed(record) {
     .setTitle(record.title)
     .addFields(
       { name: 'Date', value: record.date, inline: true },
-      { name: 'Timing', value: record.timing, inline: true }
+      { name: 'Timing', value: record.timing, inline: true },
+      ...roleFields
     )
-    .setDescription(lines.join('\n'))
     .setFooter({ text: 'React below to sign up for a role!' });
 }
 
